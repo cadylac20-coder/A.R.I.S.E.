@@ -1,2 +1,4 @@
 # A.R.I.S.E.
-A chess bot (Work in progress)
+A chess bot
+Made using python only
+(Work in progress)
