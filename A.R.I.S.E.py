@@ -510,6 +510,225 @@ class ChessAI:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# CHAOS MODE — "what if the board itself is an enemy?"
+# ══════════════════════════════════════════════════════════════════════════
+
+class ChaosHazards:
+    """
+    Every TRIGGER_INTERVAL plies (default 5), one random environmental
+    event fires on the board:
+
+      EARTHQUAKE  — an entire file shifts up or down by one square.
+                    Pieces pushed off the edge are destroyed. Instantaneous —
+                    the board is altered once, then normal play resumes.
+
+      BLACK HOLE  — a gravity well opens on a random square. Anything
+                    already there is destroyed immediately. It then
+                    persists: on every subsequent ply, pieces within
+                    BLACK_HOLE_RADIUS are pulled one step closer, and
+                    anything pulled onto the centre square is destroyed.
+
+      THAWING ICE — a few random squares become ice. If the SAME piece
+                    remains on an ice square for more than two consecutive
+                    plies, it falls through and is lost. The ice melts
+                    away once it claims a piece.
+
+    If a king is destroyed by any hazard, `king_lost_color` is set —
+    the app treats this as an immediate, authoritative game-over and
+    does not rely on python-chess's normal checkmate detection (which
+    doesn't have a "your king was eaten by a black hole" concept).
+
+    Note: hazard state (ice/black holes/log) is NOT restored by Undo —
+    only the chess position and move list are. This is a deliberate
+    simplification given how much extra state true environmental
+    rewind would require.
+    """
+    TRIGGER_INTERVAL      = 5
+    BLACK_HOLE_RADIUS     = 2
+    MAX_BLACK_HOLES       = 3
+    ICE_SQUARES_PER_EVENT = 3
+    MAX_ICE_SQUARES       = 10
+
+    def __init__(self):
+        self.enabled       = False
+        self.ply_counter   = 0
+        self.black_holes   = []     # [{"square": int}, ...]
+        self.ice_squares   = {}     # square -> {"occupant_key": str|None, "turns": int}
+        self.log           = []     # human-readable event log, most recent last
+        self.king_lost_color = None
+
+    def reset(self):
+        self.ply_counter = 0
+        self.black_holes.clear()
+        self.ice_squares.clear()
+        self.log.clear()
+        self.king_lost_color = None
+
+    def _log_event(self, msg):
+        self.log.append(msg)
+        self.log[:] = self.log[-6:]   # keep the side panel readable
+
+    def _occupant_key(self, board, square):
+        piece = board.piece_at(square)
+        return None if piece is None else piece.symbol()
+
+    def _destroy_piece(self, board, square, reason):
+        piece = board.piece_at(square)
+        if piece is None:
+            return
+        if piece.piece_type == chess.KING:
+            self.king_lost_color = piece.color
+            colour_word = "White" if piece.color == chess.WHITE else "Black"
+            self._log_event(f"The {colour_word} king was destroyed! ({reason})")
+        else:
+            self._log_event(f"{chess.piece_name(piece.piece_type).capitalize()} lost — {reason}.")
+        board.remove_piece_at(square)
+
+    # ── Called once after EVERY ply while chaos mode is enabled ───────────
+    def on_move_played(self, board: chess.Board):
+        if not self.enabled:
+            return
+        self.ply_counter += 1
+        self._tick_black_holes(board)
+        self._tick_ice(board)
+        if self.ply_counter % self.TRIGGER_INTERVAL == 0:
+            self._trigger_random_event(board)
+
+    # ── EARTHQUAKE ──────────────────────────────────────────────────────────
+    def _earthquake(self, board: chess.Board):
+        file_idx  = random.randint(0, 7)
+        direction = random.choice([-1, 1])
+
+        column_pieces = {}
+        for rank in range(8):
+            piece = board.piece_at(chess.square(file_idx, rank))
+            if piece:
+                column_pieces[rank] = piece
+        for rank in range(8):
+            board.remove_piece_at(chess.square(file_idx, rank))
+
+        destroyed = []
+        for rank, piece in column_pieces.items():
+            new_rank = rank + direction
+            if 0 <= new_rank <= 7:
+                board.set_piece_at(chess.square(file_idx, new_rank), piece)
+            else:
+                if piece.piece_type == chess.KING:
+                    self.king_lost_color = piece.color
+                destroyed.append(piece)
+
+        file_letter = chess.FILE_NAMES[file_idx]
+        dir_word = "up" if direction == 1 else "down"
+        msg = f"EARTHQUAKE! The {file_letter}-file shifted {dir_word}."
+        if destroyed:
+            names = ", ".join(chess.piece_name(p.piece_type) for p in destroyed)
+            msg += f" Lost off the edge: {names}."
+            if any(p.piece_type == chess.KING for p in destroyed):
+                colour_word = "White" if self.king_lost_color == chess.WHITE else "Black"
+                msg += f" The {colour_word} king fell off the board!"
+        self._log_event(msg)
+
+    # ── BLACK HOLE ────────────────────────────────────────────────────────
+    def _spawn_black_hole(self, board: chess.Board):
+        empty_squares = [sq for sq in chess.SQUARES if board.piece_at(sq) is None]
+        centre = random.choice(empty_squares) if empty_squares else random.choice(list(chess.SQUARES))
+        if board.piece_at(centre) is not None:
+            self._destroy_piece(board, centre, "swallowed by a new black hole")
+        self.black_holes.append({"square": centre})
+        if len(self.black_holes) > self.MAX_BLACK_HOLES:
+            self.black_holes.pop(0)
+        self._log_event(f"A BLACK HOLE opened at {chess.square_name(centre)}!")
+
+    def _tick_black_holes(self, board: chess.Board):
+        for hole in list(self.black_holes):
+            centre = hole["square"]
+            cf, cr = chess.square_file(centre), chess.square_rank(centre)
+
+            pulls = []
+            for sq in chess.SQUARES:
+                if sq == centre:
+                    continue
+                piece = board.piece_at(sq)
+                if not piece:
+                    continue
+                f, r = chess.square_file(sq), chess.square_rank(sq)
+                dist = max(abs(f - cf), abs(r - cr))   # Chebyshev distance
+                if 1 <= dist <= self.BLACK_HOLE_RADIUS:
+                    step_f = f + (1 if cf > f else (-1 if cf < f else 0))
+                    step_r = r + (1 if cr > r else (-1 if cr < r else 0))
+                    pulls.append((sq, chess.square(step_f, step_r), piece))
+
+            claimed = set()
+            for src, dst, piece in pulls:
+                if dst in claimed:
+                    continue
+                if board.piece_at(src) != piece:
+                    continue   # already moved/consumed earlier in this tick
+                board.remove_piece_at(src)
+                if dst == centre:
+                    if piece.piece_type == chess.KING:
+                        self.king_lost_color = piece.color
+                        colour_word = "White" if piece.color == chess.WHITE else "Black"
+                        self._log_event(f"The {colour_word} king was pulled into the void!")
+                    else:
+                        self._log_event(f"{chess.piece_name(piece.piece_type).capitalize()} was pulled into the black hole.")
+                else:
+                    existing = board.piece_at(dst)
+                    if existing is not None:
+                        if existing.piece_type == chess.KING:
+                            self.king_lost_color = existing.color
+                        board.remove_piece_at(dst)
+                    board.set_piece_at(dst, piece)
+                claimed.add(dst)
+
+    # ── THAWING ICE ───────────────────────────────────────────────────────
+    def _spawn_ice(self, board: chess.Board):
+        candidates = [sq for sq in chess.SQUARES if sq not in self.ice_squares]
+        random.shuffle(candidates)
+        chosen = candidates[:self.ICE_SQUARES_PER_EVENT]
+        for sq in chosen:
+            self.ice_squares[sq] = {
+                "occupant_key": self._occupant_key(board, sq),
+                "turns": 1 if board.piece_at(sq) else 0,
+            }
+        if len(self.ice_squares) > self.MAX_ICE_SQUARES:
+            oldest_keys = list(self.ice_squares.keys())[: len(self.ice_squares) - self.MAX_ICE_SQUARES]
+            for k in oldest_keys:
+                del self.ice_squares[k]
+        names = ", ".join(chess.square_name(s) for s in chosen)
+        self._log_event(f"THAWING ICE has formed on {names}.")
+
+    def _tick_ice(self, board: chess.Board):
+        melted = []
+        for sq, info in self.ice_squares.items():
+            key = self._occupant_key(board, sq)
+            if key is None:
+                info["occupant_key"] = None
+                info["turns"] = 0
+                continue
+            if key == info["occupant_key"]:
+                info["turns"] += 1
+            else:
+                info["occupant_key"] = key
+                info["turns"] = 1
+            if info["turns"] > 2:
+                self._destroy_piece(board, sq, "fell through the thawing ice")
+                melted.append(sq)
+        for sq in melted:
+            del self.ice_squares[sq]   # the ice melts away after claiming a piece
+
+    # ── DISPATCH ──────────────────────────────────────────────────────────
+    def _trigger_random_event(self, board: chess.Board):
+        event = random.choice(["earthquake", "black_hole", "ice"])
+        if event == "earthquake":
+            self._earthquake(board)
+        elif event == "black_hole":
+            self._spawn_black_hole(board)
+        else:
+            self._spawn_ice(board)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # VISION MODE — webcam chessboard detection (from original A.R.I.S.E.)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -702,6 +921,8 @@ class AriseApp:
         self.status_message = ""
         self.game_over_shown = False
 
+        self.hazards = ChaosHazards()
+
         self._build_buttons()
         self._build_sandbox_palette()
 
@@ -738,6 +959,7 @@ class AriseApp:
             "cycle_ai", "btn_ai")
         add(f"Pieces: {PIECE_STYLE_LABELS[self.piece_style]}",
             "cycle_piece_style", "btn_piece_style")
+        add("Chaos Mode: OFF",       "toggle_chaos", "btn_chaos")
         add("Flip Board",            "flip_board")
         if HAS_CV2:
             add("Vision Mode (webcam)", "vision_mode")
@@ -770,6 +992,9 @@ class AriseApp:
     # ── Game flow helpers ─────────────────────────────────────────────────
 
     def attempt_move(self, from_sq, to_sq):
+        if self.hazards.king_lost_color is not None:
+            return False   # a king has already been destroyed — game is over
+
         move = chess.Move(from_sq, to_sq)
         # Auto-queen promotions for simplicity
         piece = self.engine.board.piece_at(from_sq)
@@ -780,6 +1005,7 @@ class AriseApp:
                 move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
 
         if self.engine.push_move(move):
+            self.hazards.on_move_played(self.engine.board)   # tick hazards + maybe trigger an event
             self.game_clock.complete_move()
             self.game_clock.start_turn(self.engine.board.turn)
             self.selected_square = None
@@ -789,6 +1015,15 @@ class AriseApp:
         return False
 
     def _check_game_over(self):
+        # Hazard-induced king loss is authoritative and checked FIRST —
+        # python-chess's normal checkmate/stalemate logic assumes a king
+        # exists for both sides, which is no longer guaranteed in Chaos Mode.
+        if self.hazards.king_lost_color is not None:
+            winner = "Black" if self.hazards.king_lost_color == chess.WHITE else "White"
+            loser_word = "White's" if self.hazards.king_lost_color == chess.WHITE else "Black's"
+            self.status_message = f"GAME OVER — {loser_word} king was lost to the board! {winner} wins."
+            return
+
         board = self.engine.board
         if board.is_checkmate():
             winner = "Black" if board.turn == chess.WHITE else "White"
@@ -809,6 +1044,8 @@ class AriseApp:
     def maybe_ai_move(self):
         if self.app_mode != "play":
             return
+        if self.hazards.king_lost_color is not None:
+            return   # game already ended via a hazard
         board = self.engine.board
         if board.is_game_over():
             return
@@ -821,6 +1058,7 @@ class AriseApp:
         move = self.ai.choose_move(board)
         if move is not None:
             self.engine.push_move(move)
+            self.hazards.on_move_played(self.engine.board)
             self.game_clock.complete_move()
             self.game_clock.start_turn(self.engine.board.turn)
             self._check_game_over()
@@ -834,6 +1072,7 @@ class AriseApp:
         self.game_clock.reset(preset[1], preset[2], preset[3])
         self.game_clock.start_turn(chess.WHITE)
         self.status_message = ""
+        self.hazards.reset()   # fresh hazard timer, no leftover ice/black holes
 
     # ── Button dispatch ───────────────────────────────────────────────────
 
@@ -917,6 +1156,16 @@ class AriseApp:
             self._piece_surface_cache.clear()   # old style's cached surfaces are stale
             self.btn_piece_style.label = f"Pieces: {PIECE_STYLE_LABELS[self.piece_style]}"
 
+        elif action == "toggle_chaos":
+            self.hazards.enabled = not self.hazards.enabled
+            self.hazards.reset()   # restart the 5-ply timer fresh from now
+            state_word = "ON" if self.hazards.enabled else "OFF"
+            self.btn_chaos.label = f"Chaos Mode: {state_word}"
+            if self.hazards.enabled:
+                self.status_message = "Chaos Mode enabled — the board is now an enemy."
+            else:
+                self.status_message = "Chaos Mode disabled."
+
         elif action == "flip_board":
             self.white_at_bottom = not self.white_at_bottom
 
@@ -961,6 +1210,9 @@ class AriseApp:
         if self.app_mode == "sandbox":
             self.handle_sandbox_click(pos)
             return
+
+        if self.hazards.king_lost_color is not None:
+            return   # game over via hazard — board is frozen, only panel buttons work
 
         # ── Play mode board click ────────────────────────────────────────
         square = screen_to_square(pos, self.white_at_bottom)
@@ -1032,6 +1284,30 @@ class AriseApp:
 
             if square == self.selected_square:
                 pygame.draw.rect(self.screen, theme["highlight"], (x, y, SQUARE, SQUARE), 4)
+
+        # ── Chaos Mode hazard overlays ────────────────────────────────────
+        if self.hazards.enabled:
+            # Ice squares — pale cyan tint, darker the longer something has stood on it
+            for sq, info in self.hazards.ice_squares.items():
+                x, y = square_to_screen(sq, self.white_at_bottom)
+                alpha = 70 + info["turns"] * 40   # gets more opaque as danger increases
+                overlay = pygame.Surface((SQUARE, SQUARE), pygame.SRCALPHA)
+                overlay.fill((140, 220, 255, min(alpha, 200)))
+                self.screen.blit(overlay, (x, y))
+                pygame.draw.rect(self.screen, (200, 240, 255), (x, y, SQUARE, SQUARE), 2)
+
+            # Black holes — dark purple void with concentric rings
+            for hole in self.hazards.black_holes:
+                x, y = square_to_screen(hole["square"], self.white_at_bottom)
+                cx, cy = x + SQUARE // 2, y + SQUARE // 2
+                overlay = pygame.Surface((SQUARE, SQUARE), pygame.SRCALPHA)
+                overlay.fill((30, 0, 40, 180))
+                self.screen.blit(overlay, (x, y))
+                pulse = (pygame.time.get_ticks() // 200) % 3
+                for ring in range(3):
+                    radius = SQUARE // 2 - ring * 10 - pulse * 3
+                    if radius > 2:
+                        pygame.draw.circle(self.screen, (170, 60, 220), (cx, cy), radius, 2)
 
         # Check flash on king square
         board = self.engine.board
@@ -1220,6 +1496,8 @@ class AriseApp:
             self._render_sandbox_palette()
         else:
             self._render_move_history()
+            if self.hazards.enabled:
+                self._render_hazard_log()
             self._render_clock()
 
     def _render_sandbox_palette(self):
@@ -1259,8 +1537,9 @@ class AriseApp:
         y += 28
 
         history = self.engine.san_history
-        line = ""
         row_y = y
+        # Leave extra room for the hazard log panel when Chaos Mode is active
+        cutoff = WINDOW_H - 300 if self.hazards.enabled else WINDOW_H - 160
         for i in range(0, len(history), 2):
             move_no = i // 2 + 1
             white_move = history[i]
@@ -1269,10 +1548,34 @@ class AriseApp:
             txt = self.font_small.render(line, True, theme["text"])
             self.screen.blit(txt, (BOARD_PIXELS + 16, row_y))
             row_y += 20
-            if row_y > WINDOW_H - 160:
-                # stop drawing once we'd overlap the clock area; PGN export
+            if row_y > cutoff:
+                # stop drawing once we'd overlap other panels; PGN export
                 # still has the FULL history even if the panel can't show it
                 break
+
+    def _render_hazard_log(self):
+        """Chaos Mode status panel — next-event countdown + recent hazard events."""
+        theme = self.theme
+        y = WINDOW_H - 230
+        pygame.draw.line(self.screen, theme["border"],
+                          (BOARD_PIXELS + 10, y - 8), (WINDOW_W - 10, y - 8), 2)
+
+        header = self.font.render("Chaos Log", True, theme["check"])
+        self.screen.blit(header, (BOARD_PIXELS + 16, y))
+        y += 24
+
+        interval = ChaosHazards.TRIGGER_INTERVAL
+        remainder = self.hazards.ply_counter % interval
+        next_in = interval - remainder if remainder != 0 else interval
+        countdown = self.font_small.render(f"Next event in {next_in} ply", True, theme["text"])
+        self.screen.blit(countdown, (BOARD_PIXELS + 16, y))
+        y += 22
+
+        for entry in self.hazards.log[-4:]:
+            text = entry if len(entry) <= 44 else entry[:43] + "…"
+            txt = self.font_small.render(text, True, theme["text"])
+            self.screen.blit(txt, (BOARD_PIXELS + 16, y))
+            y += 18
 
     def _render_clock(self):
         theme = self.theme
